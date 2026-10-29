@@ -1,0 +1,24 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Downloaded files & temporary storage
+images/
+*.tmp
+*.log
+
+# System & IDE
+.DS_Store
+.idea/
+.vscode/

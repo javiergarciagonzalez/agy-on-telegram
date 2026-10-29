@@ -1,0 +1,16 @@
+[Unit]
+Description=Lightweight AGY Telegram Bot Daemon
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/agy-on-telegram
+EnvironmentFile=%h/agy-on-telegram/.env
+ExecStart=/usr/bin/python3 %h/agy-on-telegram/bot.py
+Restart=always
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
