@@ -1,8 +1,8 @@
 # agy-on-telegram
 
-A lightweight, robust, and feature-rich Telegram Bot gateway to interact directly with Google's **Antigravity CLI (`agy`)** agent from your phone, desktop, or tablet.
+A lightweight, robust, and feature-rich Telegram Bot gateway to interact directly with Google's **Antigravity CLI (`agy`)** agent from your phone, desktop, or tablet. Built with native cross-platform support for **Linux** and **macOS** (Apple Silicon & Intel).
 
-Whether running on a personal workstation, home lab, VPS, or NAS, `agy-on-telegram` allows you to trigger coding sessions, run shell tasks, inspect system status, and collaborate with your agent on the go.
+Whether running on a personal Mac, Linux workstation, home lab, VPS, or NAS, `agy-on-telegram` allows you to trigger coding sessions, run shell tasks, inspect system status, and collaborate with your agent on the go.
 
 ---
 
@@ -95,9 +95,11 @@ Send `/start` to your bot on Telegram to verify the connection!
 
 ---
 
-## 🛠️ Running as a Systemd Service (Linux)
+## 🛠️ Running in Background
 
-To keep the bot running continuously in the background and ensure it automatically restarts on system reboot, you can configure it as a **systemd user service**:
+### On Linux (Systemd Service)
+
+To keep the bot running continuously in the background and ensure it automatically restarts on system reboot, configure it as a **systemd user service**:
 
 1. Copy the provided unit file:
    ```bash
@@ -117,6 +119,33 @@ To keep the bot running continuously in the background and ensure it automatical
    ```bash
    journalctl --user -u agy-telegram-bot -f
    ```
+
+### On macOS (LaunchAgent)
+
+To run the bot as a background service on macOS (Apple Silicon or Intel) managed by `launchd`:
+
+1. Copy the provided LaunchAgent plist:
+   ```bash
+   mkdir -p ~/Library/LaunchAgents
+   cp launchd/com.user.agy-telegram-bot.plist ~/Library/LaunchAgents/
+   ```
+
+2. Edit `~/Library/LaunchAgents/com.user.agy-telegram-bot.plist` and update `YOUR_USERNAME` and your Python path (e.g. `/opt/homebrew/bin/python3` or virtual environment Python).
+
+3. Load and start the agent:
+   ```bash
+   launchctl load ~/Library/LaunchAgents/com.user.agy-telegram-bot.plist
+   ```
+
+4. View logs:
+   ```bash
+   tail -f /tmp/agy-telegram-bot.log
+   ```
+
+To stop or unload:
+```bash
+launchctl unload ~/Library/LaunchAgents/com.user.agy-telegram-bot.plist
+```
 
 ---
 

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.agy-telegram-bot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- Replace with path to your python3 binary or virtualenv (e.g. /opt/homebrew/bin/python3) -->
+        <string>/usr/bin/python3</string>
+        <string>/Users/YOUR_USERNAME/agy-on-telegram/bot.py</string>
+    </array>
+
+    <!-- Working directory (should match where agy-on-telegram is located) -->
+    <key>WorkingDirectory</key>
+    <string>/Users/YOUR_USERNAME/agy-on-telegram</string>
+
+    <!-- Start automatically when you log into your Mac -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Keep running and restart if terminated -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Standard log files -->
+    <key>StandardOutPath</key>
+    <string>/tmp/agy-telegram-bot.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/agy-telegram-bot.err</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

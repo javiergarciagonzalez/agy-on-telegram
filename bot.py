@@ -37,8 +37,26 @@ ALLOWED_USERS_RAW = os.getenv("ALLOWED_USER_IDS", "").strip()
 ALLOWED_USERS = [u.strip() for u in ALLOWED_USERS_RAW.split(",") if u.strip()]
 
 WORKSPACE_DIR = os.getenv("WORKSPACE_DIR", os.path.expanduser("~")).strip()
-DEFAULT_AGY_BIN = shutil.which("agy") or os.path.expanduser("~/.local/bin/agy")
-AGY_BIN = os.getenv("AGY_BIN", DEFAULT_AGY_BIN).strip()
+
+# Path resolution with cross-platform support (Linux + macOS / Homebrew)
+def find_agy_binary() -> str:
+    env_bin = os.getenv("AGY_BIN", "").strip()
+    if env_bin:
+        return env_bin
+    which_bin = shutil.which("agy")
+    if which_bin:
+        return which_bin
+    candidates = [
+        os.path.expanduser("~/.local/bin/agy"),
+        "/opt/homebrew/bin/agy",  # macOS Apple Silicon
+        "/usr/local/bin/agy",     # macOS Intel / Linux
+    ]
+    for c in candidates:
+        if os.path.exists(c) and os.access(c, os.X_OK):
+            return c
+    return os.path.expanduser("~/.local/bin/agy")
+
+AGY_BIN = find_agy_binary()
 WHISPER_ENDPOINT = os.getenv("WHISPER_ENDPOINT", "http://127.0.0.1:8765/transcribe").strip()
 
 DEFAULT_IMAGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images")
@@ -296,7 +314,7 @@ def run_agy_subprocess(
     env["HOME"] = WORKSPACE_DIR
     env["USER"] = os.environ.get("USER", os.environ.get("USERNAME", getpass.getuser()))
     user_local_bin = os.path.join(env["HOME"], ".local", "bin")
-    env["PATH"] = f"{user_local_bin}:/usr/local/bin:/usr/bin:/bin:" + env.get("PATH", "")
+    env["PATH"] = f"{user_local_bin}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:" + env.get("PATH", "")
 
     stop_heartbeat = threading.Event()
 
@@ -377,33 +395,96 @@ def run_agy_subprocess(
         t.join(timeout=1.0)
 
 
+def get_uptime_seconds() -> Optional[float]:
+    """Retrieve host uptime in seconds across Linux and macOS."""
+    if os.path.exists("/proc/uptime"):
+        try:
+            with open("/proc/uptime") as f:
+                return float(f.readline().split()[0])
+        except Exception:
+            pass
+    elif sys.platform == "darwin":
+        try:
+            res = subprocess.check_output(["sysctl", "-n", "kern.boottime"], text=True)
+            match = re.search(r"sec\s*=\s*(\d+)", res)
+            if match:
+                boot_sec = int(match.group(1))
+                return max(0.0, time.time() - boot_sec)
+        except Exception:
+            pass
+    return None
+
+
+def get_memory_info() -> Tuple[Optional[float], Optional[float]]:
+    """Retrieve memory usage (used_gb, total_gb) across Linux and macOS."""
+    if os.path.exists("/proc/meminfo"):
+        try:
+            mem_info = {}
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    parts = line.split(":")
+                    if len(parts) == 2:
+                        mem_info[parts[0].strip()] = parts[1].strip()
+            mem_total_kb = int(mem_info.get("MemTotal", "0 kB").split()[0])
+            mem_avail_kb = int(mem_info.get("MemAvailable", "0 kB").split()[0])
+            return (mem_total_kb - mem_avail_kb) / (1024 * 1024), mem_total_kb / (1024 * 1024)
+        except Exception:
+            pass
+    elif sys.platform == "darwin":
+        try:
+            total_bytes = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip())
+            total_gb = total_bytes / (1024 ** 3)
+            vm = subprocess.check_output(["vm_stat"], text=True)
+            page_size = 4096
+            m_page = re.search(r"page size of (\d+) bytes", vm)
+            if m_page:
+                page_size = int(m_page.group(1))
+            free_pages = 0
+            m_free = re.search(r"Pages free:\s+(\d+)", vm)
+            m_spec = re.search(r"Pages speculative:\s+(\d+)", vm)
+            if m_free:
+                free_pages += int(m_free.group(1))
+            if m_spec:
+                free_pages += int(m_spec.group(1))
+            avail_bytes = free_pages * page_size
+            used_gb = max(0.0, (total_bytes - avail_bytes) / (1024 ** 3))
+            return used_gb, total_gb
+        except Exception:
+            pass
+    return None, None
+
+
 def get_system_status() -> str:
-    """Returns system status overview."""
+    """Returns system status overview across Linux and macOS."""
     try:
-        load1, load5, load15 = os.getloadavg()
-        mem_info = {}
-        with open("/proc/meminfo") as f:
-            for line in f:
-                parts = line.split(":")
-                if len(parts) == 2:
-                    mem_info[parts[0].strip()] = parts[1].strip()
+        try:
+            load1, load5, load15 = os.getloadavg()
+            load_str = f"{load1:.2f}, {load5:.2f}, {load15:.2f}"
+        except (AttributeError, OSError):
+            load_str = "N/A"
 
-        mem_total_kb = int(mem_info.get("MemTotal", "0 kB").split()[0])
-        mem_avail_kb = int(mem_info.get("MemAvailable", "0 kB").split()[0])
-        mem_used_gb = (mem_total_kb - mem_avail_kb) / (1024 * 1024)
-        mem_total_gb = mem_total_kb / (1024 * 1024)
+        uptime_sec = get_uptime_seconds()
+        if uptime_sec is not None:
+            days = int(uptime_sec // 86400)
+            hours = int((uptime_sec % 86400) // 3600)
+            mins = int((uptime_sec % 3600) // 60)
+            uptime_str = f"{days}d {hours}h {mins}m"
+        else:
+            uptime_str = "N/A"
 
-        with open("/proc/uptime") as f:
-            uptime_sec = float(f.readline().split()[0])
-        days = int(uptime_sec // 86400)
-        hours = int((uptime_sec % 86400) // 3600)
-        mins = int((uptime_sec % 3600) // 60)
+        used_gb, total_gb = get_memory_info()
+        if used_gb is not None and total_gb is not None:
+            ram_str = f"{used_gb:.1f} GB / {total_gb:.1f} GB used"
+        else:
+            ram_str = "N/A"
+
+        os_name = "macOS" if sys.platform == "darwin" else ("Linux" if sys.platform.startswith("linux") else sys.platform)
 
         return (
-            "📊 *System Status*\n"
-            f"• *Uptime:* {days}d {hours}h {mins}m\n"
-            f"• *CPU Load:* {load1:.2f}, {load5:.2f}, {load15:.2f}\n"
-            f"• *RAM:* {mem_used_gb:.1f} GB / {mem_total_gb:.1f} GB used\n"
+            f"📊 *System Status ({os_name})*\n"
+            f"• *Uptime:* {uptime_str}\n"
+            f"• *CPU Load:* {load_str}\n"
+            f"• *RAM:* {ram_str}\n"
             f"• *AGY Binary:* `{AGY_BIN}`\n"
             f"• *Whisper API:* `{WHISPER_ENDPOINT}`\n"
             f"• *Workspace:* `{WORKSPACE_DIR}`"
