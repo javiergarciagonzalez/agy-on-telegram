@@ -5,6 +5,7 @@
 import os
 import sys
 import re
+import html
 import time
 import json
 import uuid
@@ -86,29 +87,281 @@ signal.signal(signal.SIGINT, handle_signal)
 signal.signal(signal.SIGTERM, handle_signal)
 
 
-def split_text(text: str, max_len: int = 3900) -> List[str]:
-    """Split text into chunks that fit within Telegram limits."""
+def _clean_table_cell(cell: str) -> str:
+    """Strip inline markdown syntax inside table cells so ASCII column alignment stays accurate."""
+    c = cell.strip()
+    c = re.sub(r"\[`?([^`\]]+)`?\]\([^)\s]+\)", r"\1", c)
+    c = re.sub(r"\*\*(.+?)\*\*", r"\1", c)
+    c = re.sub(r"`([^`]+)`", r"\1", c)
+    return c
+
+
+def _format_markdown_table(table_lines: List[str]) -> str:
+    """Convert a Markdown pipe table into an aligned monospace <pre> block for Telegram."""
+    rows = []
+    for line in table_lines:
+        stripped = line.strip()
+        if re.match(r"^\|[\s:|-]+\|$", stripped):
+            continue
+        cells = [_clean_table_cell(c) for c in stripped.strip("|").split("|")]
+        rows.append(cells)
+
+    if not rows:
+        return html.escape("\n".join(table_lines))
+
+    num_cols = max(len(r) for r in rows)
+    col_widths = [0] * num_cols
+    for r in rows:
+        for i, val in enumerate(r):
+            col_widths[i] = max(col_widths[i], len(val))
+
+    formatted_lines = []
+    for r_idx, r in enumerate(rows):
+        padded = [
+            (r[i] if i < len(r) else "").ljust(col_widths[i])
+            for i in range(num_cols)
+        ]
+        formatted_lines.append(" │ ".join(padded).rstrip())
+        if r_idx == 0 and len(rows) > 1:
+            sep = "─┼─".join("─" * w for w in col_widths)
+            formatted_lines.append(sep)
+
+    return f"<pre>{html.escape(chr(10).join(formatted_lines))}</pre>"
+
+
+def markdown_to_telegram_html(text: str) -> str:
+    """
+    Convert GitHub-Flavored Markdown (as emitted by AGY) into clean Telegram HTML.
+    - Strips unsupported file:// links into monospace <code> tags while preserving http(s):// links.
+    - Converts headings (#, ##, ###), bold (**), italic (* / _), strikethrough (~~),
+      fenced code blocks (```), inline code (`), blockquotes (>), task lists, bullets, and tables.
+    """
+    if not text:
+        return ""
+
+    placeholders: List[str] = []
+
+    def add_placeholder(html_fragment: str) -> str:
+        idx = len(placeholders)
+        placeholders.append(html_fragment)
+        return f"\x00TGPH{idx}END\x00"
+
+    # 1. Extract fenced code blocks: ```lang\n...\n```
+    def replace_fenced_code(m: re.Match) -> str:
+        lang = (m.group(1) or "").strip()
+        code = m.group(2)
+        if code.startswith("\n"):
+            code = code[1:]
+        code = code.rstrip("\n")
+        escaped_code = html.escape(code)
+        if lang:
+            return add_placeholder(
+                f'<pre><code class="language-{html.escape(lang, quote=True)}">{escaped_code}</code></pre>'
+            )
+        return add_placeholder(f"<pre><code>{escaped_code}</code></pre>")
+
+    text = re.sub(r"```([a-zA-Z0-9_+-]*)[ \t]*\n?(.*?)```", replace_fenced_code, text, flags=re.DOTALL)
+
+    # 2. Extract Markdown pipe tables into aligned <pre> blocks
+    lines = text.splitlines()
+    out_lines: List[str] = []
+    i = 0
+    while i < len(lines):
+        if (
+            lines[i].strip().startswith("|")
+            and lines[i].strip().endswith("|")
+            and i + 1 < len(lines)
+            and re.match(r"^\s*\|[\s:|-]+\|\s*$", lines[i + 1])
+        ):
+            table_buf = [lines[i], lines[i + 1]]
+            i += 2
+            while i < len(lines) and lines[i].strip().startswith("|") and lines[i].strip().endswith("|"):
+                table_buf.append(lines[i])
+                i += 1
+            out_lines.append(add_placeholder(_format_markdown_table(table_buf)))
+        else:
+            out_lines.append(lines[i])
+            i += 1
+    text = "\n".join(out_lines)
+
+    # 3. Extract links wrapping inline code: [`symbol`](url)
+    def replace_code_link(m: re.Match) -> str:
+        label = m.group(1).strip()
+        url = m.group(2).strip()
+        if url.startswith(("http://", "https://", "tg://")):
+            return add_placeholder(
+                f'<a href="{html.escape(url, quote=True)}"><code>{html.escape(label)}</code></a>'
+            )
+        return add_placeholder(f"<code>{html.escape(label)}</code>")
+
+    text = re.sub(r"\[`([^`\n]+)`\]\(([^)\s]+)\)", replace_code_link, text)
+
+    # 4. Extract inline code spans: `code`
+    def replace_inline_code(m: re.Match) -> str:
+        return add_placeholder(f"<code>{html.escape(m.group(1))}</code>")
+
+    text = re.sub(r"`([^`\n]+)`", replace_inline_code, text)
+
+    # 5. Extract standard Markdown links: [label](url)
+    def replace_standard_link(m: re.Match) -> str:
+        label = m.group(1).strip().strip("`")
+        url = m.group(2).strip()
+        if url.startswith(("http://", "https://", "tg://")):
+            return add_placeholder(
+                f'<a href="{html.escape(url, quote=True)}">{html.escape(label)}</a>'
+            )
+        return add_placeholder(f"<code>{html.escape(label)}</code>")
+
+    text = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", replace_standard_link, text)
+
+    # 6. Escape remaining raw HTML characters
+    text = html.escape(text, quote=False)
+
+    # 7. Process line-level elements (blockquotes, headings, lists, horizontal rules)
+    raw_lines = text.splitlines()
+    processed_lines: List[str] = []
+    quote_buffer: List[str] = []
+
+    alert_map = {
+        "[!NOTE]": "ℹ️ <b>Nota</b>",
+        "[!TIP]": "💡 <b>Consejo</b>",
+        "[!IMPORTANT]": "📌 <b>Importante</b>",
+        "[!WARNING]": "⚠️ <b>Aviso</b>",
+        "[!CAUTION]": "🚨 <b>Precaución</b>",
+    }
+
+    def flush_quote():
+        if quote_buffer:
+            content = "\n".join(quote_buffer).strip()
+            processed_lines.append(f"<blockquote>{content}</blockquote>")
+            quote_buffer.clear()
+
+    for line in raw_lines:
+        q_match = re.match(r"^\s*&gt;\s?(.*)$", line)
+        if q_match:
+            q_content = q_match.group(1)
+            for tag, replacement in alert_map.items():
+                if q_content.strip().startswith(tag):
+                    rest = q_content.strip()[len(tag):].strip()
+                    q_content = f"{replacement}\n{rest}" if rest else replacement
+                    break
+            quote_buffer.append(q_content)
+            continue
+        else:
+            flush_quote()
+
+        # Horizontal rules
+        if re.match(r"^\s*(?:-\s*){3,}$|^\s*(?:\*\s*){3,}$|^\s*(?:_\s*){3,}$", line):
+            processed_lines.append("────────────────────")
+            continue
+
+        # Headings
+        h1 = re.match(r"^#\s+(.+)$", line)
+        if h1:
+            processed_lines.append(f"\n📌 <b>{h1.group(1).strip('* ')}</b>")
+            continue
+        h2 = re.match(r"^##\s+(.+)$", line)
+        if h2:
+            processed_lines.append(f"\n🔹 <b>{h2.group(1).strip('* ')}</b>")
+            continue
+        h3 = re.match(r"^###\s+(.+)$", line)
+        if h3:
+            processed_lines.append(f"\n▸ <b>{h3.group(1).strip('* ')}</b>")
+            continue
+        h4 = re.match(r"^#{4,6}\s+(.+)$", line)
+        if h4:
+            processed_lines.append(f"• <b>{h4.group(1).strip('* ')}</b>")
+            continue
+
+        # Task lists
+        task_done = re.match(r"^(\s*)[-*]\s+\[[xX]\]\s+(.+)$", line)
+        if task_done:
+            indent = "  " * (len(task_done.group(1)) // 2)
+            processed_lines.append(f"{indent}✅ {task_done.group(2)}")
+            continue
+        task_todo = re.match(r"^(\s*)[-*]\s+\[\s\]\s+(.+)$", line)
+        if task_todo:
+            indent = "  " * (len(task_todo.group(1)) // 2)
+            processed_lines.append(f"{indent}⬜ {task_todo.group(2)}")
+            continue
+
+        # Unordered bullet lists
+        bullet = re.match(r"^(\s*)[-*]\s+(.+)$", line)
+        if bullet:
+            indent = "  " * (len(bullet.group(1)) // 2)
+            processed_lines.append(f"{indent}• {bullet.group(2)}")
+            continue
+
+        processed_lines.append(line)
+
+    flush_quote()
+    text = "\n".join(processed_lines)
+
+    # 8. Inline formatting: bold, italic, strikethrough
+    text = re.sub(r"\*\*\*(.+?)\*\*\*", r"<b><i>\1</i></b>", text)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
+    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
+    text = re.sub(r"(?<!\*)\*([^*\n]+?)\*(?!\*)", r"<i>\1</i>", text)
+    text = re.sub(r"(?<![\w\\])_([^_\n]+?)_(?![\w])", r"<i>\1</i>", text)
+
+    # 9. Restore placeholders
+    for idx, fragment in enumerate(placeholders):
+        text = text.replace(f"\x00TGPH{idx}END\x00", fragment)
+
+    # Clean excessive blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+
+def split_text(text: str, max_len: int = 3500) -> List[str]:
+    """
+    Split Markdown text into chunks that fit within Telegram limits after HTML conversion,
+    automatically closing and reopening fenced code blocks across chunk boundaries.
+    """
     if len(text) <= max_len:
         return [text]
 
-    chunks = []
+    chunks: List[str] = []
     lines = text.splitlines(keepends=True)
-    current_chunk = []
+    current_chunk: List[str] = []
     current_len = 0
+    open_fence: Optional[str] = None
 
     for line in lines:
         if current_len + len(line) > max_len:
             if current_chunk:
+                if open_fence is not None:
+                    current_chunk.append("\n```")
                 chunks.append("".join(current_chunk))
                 current_chunk = []
                 current_len = 0
+                if open_fence is not None:
+                    reopen = f"{open_fence}\n"
+                    current_chunk.append(reopen)
+                    current_len += len(reopen)
+
             while len(line) > max_len:
-                chunks.append(line[:max_len])
+                part = line[:max_len]
+                if open_fence is not None:
+                    chunks.append(f"{open_fence}\n{part}\n```")
+                else:
+                    chunks.append(part)
                 line = line[max_len:]
+
+        fence_match = re.match(r"^\s*(```[a-zA-Z0-9_+-]*)\s*$", line)
+        if fence_match:
+            if open_fence is None:
+                open_fence = fence_match.group(1)
+            else:
+                open_fence = None
+
         current_chunk.append(line)
         current_len += len(line)
 
     if current_chunk:
+        if open_fence is not None:
+            current_chunk.append("\n```")
         chunks.append("".join(current_chunk))
 
     return chunks
@@ -137,15 +390,17 @@ def send_message(
     reply_to_id: Optional[int] = None,
     reply_markup: Optional[dict] = None,
 ) -> List[int]:
-    """Send message with markdown, falling back to plain text if parsing fails."""
+    """Send message formatted as Telegram HTML, falling back to plain text if parsing fails."""
     chunks = split_text(text)
     sent_ids = []
 
     for idx, chunk in enumerate(chunks):
+        html_chunk = markdown_to_telegram_html(chunk)
         payload = {
             "chat_id": chat_id,
-            "text": chunk,
-            "parse_mode": "Markdown",
+            "text": html_chunk,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
         }
         if reply_to_id and not sent_ids:
             payload["reply_to_message_id"] = reply_to_id
@@ -157,6 +412,7 @@ def send_message(
             sent_ids.append(res["result"]["message_id"])
         else:
             payload.pop("parse_mode", None)
+            payload["text"] = chunk
             res2 = tg_request("sendMessage", payload)
             if res2 and res2.get("ok"):
                 sent_ids.append(res2["result"]["message_id"])
@@ -170,15 +426,17 @@ def edit_message(
     text: str,
     reply_markup: Optional[dict] = None,
 ) -> bool:
-    """Edit an existing message, supporting optional inline keyboards."""
+    """Edit an existing message using Telegram HTML formatting, supporting optional inline keyboards."""
     chunks = split_text(text)
     first_chunk = chunks[0]
+    html_first = markdown_to_telegram_html(first_chunk)
 
     payload = {
         "chat_id": chat_id,
         "message_id": message_id,
-        "text": first_chunk,
-        "parse_mode": "Markdown",
+        "text": html_first,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
     }
     if reply_markup is not None:
         payload["reply_markup"] = reply_markup
@@ -186,6 +444,7 @@ def edit_message(
     res = tg_request("editMessageText", payload)
     if not (res and res.get("ok")):
         payload.pop("parse_mode", None)
+        payload["text"] = first_chunk
         res2 = tg_request("editMessageText", payload)
         success = bool(res2 and res2.get("ok"))
     else:
@@ -370,7 +629,7 @@ def run_agy_subprocess(
                         edit_message(
                             chat_id,
                             status_msg_id,
-                            f"⚠️ *Fallo temporal en AGY (intento {attempt}/{total_attempts})*.\n"
+                            f"⚠️ **Fallo temporal en AGY (intento {attempt}/{total_attempts})**.\n"
                             f"Reintentando en {delay}s ({attempt} de {max_retries} reintentos)...\n\n"
                             f"_Error: {err_preview}_",
                         )
@@ -384,12 +643,12 @@ def run_agy_subprocess(
                         edit_message(
                             chat_id,
                             status_msg_id,
-                            f"🧠 *AGY ejecutando tarea (reintento {attempt}/{max_retries})...*",
+                            f"🧠 **AGY ejecutando tarea (reintento {attempt}/{max_retries})...**",
                         )
                     except Exception as me:
                         logger.warning(f"Failed to edit status message on resume: {me}")
 
-        return f"❌ *Error de ejecución de AGY tras {max_retries} reintentos (código {last_return_code})*:\n```\n{last_error}\n```"
+        return f"❌ **Error de ejecución de AGY tras {max_retries} reintentos (código {last_return_code})**:\n```\n{last_error}\n```"
     finally:
         stop_heartbeat.set()
         t.join(timeout=1.0)
@@ -481,13 +740,13 @@ def get_system_status() -> str:
         os_name = "macOS" if sys.platform == "darwin" else ("Linux" if sys.platform.startswith("linux") else sys.platform)
 
         return (
-            f"📊 *System Status ({os_name})*\n"
-            f"• *Uptime:* {uptime_str}\n"
-            f"• *CPU Load:* {load_str}\n"
-            f"• *RAM:* {ram_str}\n"
-            f"• *AGY Binary:* `{AGY_BIN}`\n"
-            f"• *Whisper API:* `{WHISPER_ENDPOINT}`\n"
-            f"• *Workspace:* `{WORKSPACE_DIR}`"
+            f"📊 **System Status ({os_name})**\n"
+            f"• **Uptime:** {uptime_str}\n"
+            f"• **CPU Load:** {load_str}\n"
+            f"• **RAM:** {ram_str}\n"
+            f"• **AGY Binary:** `{AGY_BIN}`\n"
+            f"• **Whisper API:** `{WHISPER_ENDPOINT}`\n"
+            f"• **Workspace:** `{WORKSPACE_DIR}`"
         )
     except Exception as e:
         return f"Error obtaining status: {e}"
@@ -513,14 +772,14 @@ def handle_callback_query(cb: dict):
     if data.startswith("cancel:"):
         task_id = data.split(":", 1)[1]
         pending_audio_tasks.pop(task_id, None)
-        edit_message(chat_id, message_id, "❌ *Tarea cancelada.*")
+        edit_message(chat_id, message_id, "❌ **Tarea cancelada.**")
         return
 
     if data.startswith("cont:") or data.startswith("new:"):
         action, task_id = data.split(":", 1)
         task = pending_audio_tasks.pop(task_id, None)
         if not task:
-            edit_message(chat_id, message_id, "⚠️ *Esta tarea ha expirado o ya fue procesada.*")
+            edit_message(chat_id, message_id, "⚠️ **Esta tarea ha expirado o ya fue procesada.**")
             return
 
         continue_session = (action == "cont")
@@ -530,7 +789,7 @@ def handle_callback_query(cb: dict):
         edit_message(
             chat_id,
             message_id,
-            f"🧠 *AGY ejecutando tarea ({action_label})*...\n\n📝 _{prompt}_",
+            f"🧠 **AGY ejecutando tarea ({action_label})**...\n\n📝 _{prompt}_",
         )
 
         def worker():
@@ -573,16 +832,8 @@ def process_audio_message(msg: dict):
         if now - pending_audio_tasks[tid].get("created_at", 0) > 3600:
             pending_audio_tasks.pop(tid, None)
 
-    status_msg = tg_request(
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": "🎧 *Transcribiendo nota de voz con Whisper...*",
-            "parse_mode": "Markdown",
-            "reply_to_message_id": msg_id,
-        },
-    )
-    status_id = status_msg["result"]["message_id"] if (status_msg and status_msg.get("ok")) else None
+    sent_status = send_message(chat_id, "🎧 **Transcribiendo nota de voz con Whisper...**", reply_to_id=msg_id)
+    status_id = sent_status[0] if sent_status else None
 
     def worker():
         nonlocal status_id
@@ -624,9 +875,9 @@ def process_audio_message(msg: dict):
                 logger.info(f"Explicit intent detected: {'CONTINUE' if intent else 'NEW'}. Clean prompt: {clean_prompt}")
 
                 initial_status = (
-                    f"🎙️ *Nota de voz recibida ({action_label})*\n"
+                    f"🎙️ **Nota de voz recibida ({action_label})**\n"
                     f"📝 _{clean_prompt}_\n\n"
-                    f"🧠 *AGY ejecutando tarea...*"
+                    f"🧠 **AGY ejecutando tarea...**"
                 )
                 if status_id:
                     edit_message(chat_id, status_id, initial_status)
@@ -662,7 +913,7 @@ def process_audio_message(msg: dict):
                 }
 
                 prompt_text = (
-                    f"🎙️ *Transcripción:*\n"
+                    f"🎙️ **Transcripción:**\n"
                     f"«{clean_prompt}»\n\n"
                     f"_⏱️ Transcrito en {duration:.1f}s_\n"
                     f"¿Cómo quieres ejecutar esta tarea?"
@@ -747,16 +998,8 @@ def process_image_message(msg: dict):
         continue_session = True
         user_prompt = user_prompt.split(" ", 1)[1].strip()
 
-    status_msg = tg_request(
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": "🖼️ *Descargando imagen...*",
-            "parse_mode": "Markdown",
-            "reply_to_message_id": msg_id,
-        },
-    )
-    status_id = status_msg["result"]["message_id"] if (status_msg and status_msg.get("ok")) else None
+    sent_status = send_message(chat_id, "🖼️ **Descargando imagen...**", reply_to_id=msg_id)
+    status_id = sent_status[0] if sent_status else None
 
     def worker():
         cleanup_old_images(IMAGE_DIR, max_age_days=3)
@@ -772,9 +1015,9 @@ def process_image_message(msg: dict):
             return
 
         action_label = "Continuar sesión 💬" if continue_session else "Nueva sesión limpia 🆕"
-        initial_status = f"🖼️ *Imagen recibida ({action_label})*\n🧠 *AGY analizando imagen...*"
+        initial_status = f"🖼️ **Imagen recibida ({action_label})**\n🧠 **AGY analizando imagen...**"
         if user_prompt:
-            initial_status = f"🖼️ *Imagen recibida ({action_label})*\n📝 _{user_prompt}_\n\n🧠 *AGY analizando imagen...*"
+            initial_status = f"🖼️ **Imagen recibida ({action_label})**\n📝 _{user_prompt}_\n\n🧠 **AGY analizando imagen...**"
 
         if status_id:
             edit_message(chat_id, status_id, initial_status)
@@ -839,9 +1082,9 @@ def handle_message(msg: dict):
     # Built-in commands
     if text in ["/start", "/help"]:
         welcome = (
-            "🤖 *AGY Telegram Assistant*\n\n"
+            "🤖 **AGY Telegram Assistant**\n\n"
             "Gateway connected to your Google Antigravity CLI (AGY) agent.\n\n"
-            "*Usage instructions:*\n"
+            "**Usage instructions:**\n"
             "• Send any text message to interact (persists conversation context).\n"
             "• Send a **photo or screenshot** (with or without caption) for multimodal inspection.\n"
             "• Send a **voice note** or audio:\n"
@@ -874,16 +1117,8 @@ def handle_message(msg: dict):
         send_message(chat_id, "⚠️ Por favor, escribe un prompt para ejecutar.", reply_to_id=msg.get("message_id"))
         return
 
-    status_msg = tg_request(
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "text": "🧠 *AGY ejecutando tarea...*",
-            "parse_mode": "Markdown",
-            "reply_to_message_id": msg.get("message_id"),
-        },
-    )
-    status_msg_id = status_msg["result"]["message_id"] if (status_msg and status_msg.get("ok")) else None
+    sent_status = send_message(chat_id, "🧠 **AGY ejecutando tarea...**", reply_to_id=msg.get("message_id"))
+    status_msg_id = sent_status[0] if sent_status else None
 
     def worker():
         response = run_agy_subprocess(prompt, continue_session, chat_id, status_msg_id=status_msg_id)
