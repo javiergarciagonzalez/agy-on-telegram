@@ -76,6 +76,219 @@ RUNNING = True
 # {task_id: {"text": str, "chat_id": int, "created_at": float}}
 pending_audio_tasks = {}
 
+# --- Persistent Model Preferences & Model Registry ---
+PREFERENCES_FILE = os.getenv(
+    "PREFERENCES_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "preferences.json"),
+).strip()
+
+# --- Persistent Message -> AGY Conversation Mapping ---
+CONVERSATIONS_FILE = os.getenv(
+    "CONVERSATIONS_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "conversations.json"),
+).strip()
+MAX_CONVERSATION_ENTRIES = 2000
+_conversations_lock = threading.Lock()
+
+
+def _load_conversations_unlocked() -> dict:
+    try:
+        if os.path.exists(CONVERSATIONS_FILE) and os.path.getsize(CONVERSATIONS_FILE) > 0:
+            with open(CONVERSATIONS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+    except Exception as e:
+        logger.warning(f"Error loading conversations from {CONVERSATIONS_FILE}: {e}")
+    return {}
+
+
+def save_message_conversations(chat_id: int, message_ids: List[Optional[int]], conversation_id: Optional[str]):
+    """Persistently map one or more Telegram message IDs to an AGY conversation ID."""
+    if not conversation_id or not message_ids:
+        return
+    valid_ids = [mid for mid in message_ids if mid is not None]
+    if not valid_ids:
+        return
+
+    with _conversations_lock:
+        data = _load_conversations_unlocked()
+        now = time.time()
+        for mid in valid_ids:
+            data[f"{chat_id}:{mid}"] = {
+                "conversation_id": conversation_id,
+                "updated_at": now,
+            }
+
+        if len(data) > MAX_CONVERSATION_ENTRIES:
+            sorted_items = sorted(
+                data.items(),
+                key=lambda item: item[1].get("updated_at", 0) if isinstance(item[1], dict) else 0,
+                reverse=True,
+            )
+            data = dict(sorted_items[:MAX_CONVERSATION_ENTRIES])
+
+        try:
+            tmp_path = f"{CONVERSATIONS_FILE}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp_path, CONVERSATIONS_FILE)
+        except Exception as e:
+            logger.warning(f"Error saving conversations to {CONVERSATIONS_FILE}: {e}")
+
+
+def get_conversation_for_message(chat_id: int, message_id: Optional[int]) -> Optional[str]:
+    """Look up the AGY conversation ID associated with a given Telegram message ID."""
+    if message_id is None:
+        return None
+    with _conversations_lock:
+        data = _load_conversations_unlocked()
+        entry = data.get(f"{chat_id}:{message_id}")
+        if isinstance(entry, dict):
+            return entry.get("conversation_id")
+        if isinstance(entry, str):
+            return entry
+    return None
+
+
+def get_replied_conversation_id(msg: dict) -> Optional[str]:
+    """If msg is a Telegram reply to a tracked message, return its AGY conversation ID."""
+    reply_to = msg.get("reply_to_message")
+    if not isinstance(reply_to, dict):
+        return None
+    chat_id = msg.get("chat", {}).get("id")
+    replied_msg_id = reply_to.get("message_id")
+    if chat_id is None or replied_msg_id is None:
+        return None
+    return get_conversation_for_message(chat_id, replied_msg_id)
+
+DEFAULT_MODELS = [
+    ("gemini-4-argon-medium", "Gemini 4 Argon (Medium)"),
+    ("gemini-4-argon-high", "Gemini 4 Argon (High)"),
+    ("gemini-4-argon-low", "Gemini 4 Argon (Low)"),
+    ("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)"),
+    ("gemini-3.8-flash-medium", "Gemini 3.8 Flash (Medium)"),
+    ("gemini-3.8-flash-low", "Gemini 3.8 Flash (Low)"),
+    ("claude-opus-5-5-low", "Claude Opus 5.5 (Low)"),
+    ("claude-opus-5-5-medium", "Claude Opus 5.5 (Medium)"),
+    ("claude-opus-5-5-high", "Claude Opus 5.5 (High)"),
+    ("claude-sonnet-5-5-low", "Claude Sonnet 5.5 (Low)"),
+    ("claude-sonnet-5-5-medium", "Claude Sonnet 5.5 (Medium)"),
+    ("claude-sonnet-5-5-high", "Claude Sonnet 5.5 (High)"),
+    ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)"),
+]
+
+MODELS_CACHE = {"models": [], "timestamp": 0.0}
+
+
+def load_preferences() -> dict:
+    try:
+        if os.path.exists(PREFERENCES_FILE) and os.path.getsize(PREFERENCES_FILE) > 0:
+            with open(PREFERENCES_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        logger.warning(f"Error loading preferences from {PREFERENCES_FILE}: {e}")
+    return {}
+
+
+def save_preferences(prefs: dict):
+    try:
+        tmp_path = f"{PREFERENCES_FILE}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(prefs, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, PREFERENCES_FILE)
+    except Exception as e:
+        logger.error(f"Error saving preferences to {PREFERENCES_FILE}: {e}")
+
+
+def get_available_models() -> List[Tuple[str, str]]:
+    """Fetch available models from AGY CLI, with caching and fallback."""
+    now = time.time()
+    if MODELS_CACHE["models"] and (now - MODELS_CACHE["timestamp"] < 3600):
+        return MODELS_CACHE["models"]
+
+    try:
+        res = subprocess.run(
+            [AGY_BIN, "models"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            models = []
+            for line in res.stdout.strip().splitlines():
+                parts = line.split("\t", 1)
+                if len(parts) == 2:
+                    models.append((parts[0].strip(), parts[1].strip()))
+                elif len(parts) == 1 and parts[0].strip():
+                    models.append((parts[0].strip(), parts[0].strip()))
+            if models:
+                MODELS_CACHE["models"] = models
+                MODELS_CACHE["timestamp"] = now
+                return models
+    except Exception as e:
+        logger.warning(f"Failed to fetch models from AGY CLI: {e}")
+
+    if not MODELS_CACHE["models"]:
+        MODELS_CACHE["models"] = DEFAULT_MODELS
+        MODELS_CACHE["timestamp"] = now
+    return MODELS_CACHE["models"]
+
+
+def get_current_model(chat_id: Optional[int] = None) -> str:
+    """Retrieve persisted model for this chat or global default."""
+    prefs = load_preferences()
+    if chat_id is not None:
+        chat_model = prefs.get("chat_models", {}).get(str(chat_id))
+        if chat_model:
+            return chat_model
+    default_model = prefs.get("default_model")
+    if default_model:
+        return default_model
+    return "gemini-3.8-flash-medium"
+
+
+def set_current_model(model_id: str, chat_id: Optional[int] = None):
+    """Persist chosen model for chat and global default."""
+    prefs = load_preferences()
+    prefs["default_model"] = model_id
+    if chat_id is not None:
+        if "chat_models" not in prefs:
+            prefs["chat_models"] = {}
+        prefs["chat_models"][str(chat_id)] = model_id
+    save_preferences(prefs)
+    logger.info(f"Model updated to '{model_id}' (chat_id={chat_id})")
+
+
+def get_model_label(model_id: str) -> str:
+    """Return friendly label for a model ID."""
+    for m_id, label in get_available_models():
+        if m_id == model_id:
+            return label
+    return model_id
+
+
+def build_model_selection_message(chat_id: int) -> Tuple[str, dict]:
+    """Build message and inline keyboard for model selection."""
+    current_model = get_current_model(chat_id)
+    models = get_available_models()
+    current_label = get_model_label(current_model)
+
+    text = (
+        f"🤖 **Selección de Modelo de AGY**\n\n"
+        f"• **Modelo actual:** `{current_label}` (`{current_model}`)\n\n"
+        f"Toca un modelo de la lista para activarlo. Esta selección se recordará tanto para **nuevos chats** como para **continuaciones** (`/c`):\n"
+    )
+
+    keyboard_buttons = []
+    for m_id, label in models:
+        is_active = (m_id == current_model)
+        btn_text = f"✅ {label}" if is_active else label
+        keyboard_buttons.append([{"text": btn_text, "callback_data": f"set_model:{m_id}"}])
+
+    keyboard = {"inline_keyboard": keyboard_buttons}
+    return text, keyboard
+
 
 def handle_signal(sig, frame):
     global RUNNING
@@ -425,8 +638,12 @@ def edit_message(
     message_id: int,
     text: str,
     reply_markup: Optional[dict] = None,
+    out_message_ids: Optional[List[int]] = None,
 ) -> bool:
     """Edit an existing message using Telegram HTML formatting, supporting optional inline keyboards."""
+    if out_message_ids is not None:
+        out_message_ids.append(message_id)
+
     chunks = split_text(text)
     first_chunk = chunks[0]
     html_first = markdown_to_telegram_html(first_chunk)
@@ -452,7 +669,9 @@ def edit_message(
 
     if len(chunks) > 1:
         for chunk in chunks[1:]:
-            send_message(chat_id, chunk)
+            extra_ids = send_message(chat_id, chunk)
+            if out_message_ids is not None and extra_ids:
+                out_message_ids.extend(extra_ids)
 
     return success
 
@@ -554,18 +773,60 @@ def detect_session_intent(raw_text: str) -> Tuple[Optional[bool], str]:
     return None, text
 
 
+def _parse_agy_json_output(raw_stdout: str) -> Tuple[str, Optional[str]]:
+    """Parse AGY JSON output into (response_text, conversation_id)."""
+    text = raw_stdout.strip()
+    if not text:
+        return "✅ Tarea completada sin salida de texto.", None
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            conv_id = data.get("conversation_id")
+            resp = str(data.get("response") or "").strip()
+            return (resp if resp else "✅ Tarea completada sin salida de texto."), conv_id
+    except json.JSONDecodeError:
+        for line in reversed(text.splitlines()):
+            line = line.strip()
+            if line.startswith("{") and line.endswith("}"):
+                try:
+                    data = json.loads(line)
+                    if isinstance(data, dict):
+                        conv_id = data.get("conversation_id")
+                        resp = str(data.get("response") or "").strip()
+                        return (resp if resp else "✅ Tarea completada sin salida de texto."), conv_id
+                except json.JSONDecodeError:
+                    pass
+    return text, None
+
+
 def run_agy_subprocess(
     prompt: str,
     continue_session: bool,
     chat_id: int,
     status_msg_id: Optional[int] = None,
     max_retries: int = 3,
-) -> str:
+    model: Optional[str] = None,
+    conversation_id: Optional[str] = None,
+) -> Tuple[str, Optional[str]]:
     """Run AGY in non-interactive print mode with periodic typing indicators and automatic retries."""
+    if model is None:
+        model = get_current_model(chat_id)
+    model_label = get_model_label(model)
+    if conversation_id:
+        action_label = "Continuar hilo 💬"
+    elif continue_session:
+        action_label = "Continuar sesión 💬"
+    else:
+        action_label = "Nuevo chat 🆕"
+
     cmd = [AGY_BIN]
-    if continue_session:
+    if conversation_id:
+        cmd.extend(["--conversation", conversation_id])
+    elif continue_session:
         cmd.append("-c")
-    cmd.extend(["-p", prompt, "--dangerously-skip-permissions"])
+    if model:
+        cmd.extend(["--model", model])
+    cmd.extend(["-p", prompt, "--output-format", "json", "--dangerously-skip-permissions"])
 
     logger.info(f"Running AGY command: {' '.join(cmd)}")
 
@@ -605,8 +866,8 @@ def run_agy_subprocess(
                 last_return_code = proc.returncode
 
                 if last_return_code == 0:
-                    output = stdout.strip()
-                    return output if output else "✅ Tarea completada sin salida de texto."
+                    parsed_text, parsed_conv_id = _parse_agy_json_output(stdout)
+                    return parsed_text, (parsed_conv_id or conversation_id)
 
                 last_error = stderr.strip() or stdout.strip()
                 logger.warning(
@@ -629,7 +890,7 @@ def run_agy_subprocess(
                         edit_message(
                             chat_id,
                             status_msg_id,
-                            f"⚠️ **Fallo temporal en AGY (intento {attempt}/{total_attempts})**.\n"
+                            f"⚠️ **Fallo temporal en AGY (intento {attempt}/{total_attempts})** [Modelo: `{model_label}`].\n"
                             f"Reintentando en {delay}s ({attempt} de {max_retries} reintentos)...\n\n"
                             f"_Error: {err_preview}_",
                         )
@@ -643,12 +904,24 @@ def run_agy_subprocess(
                         edit_message(
                             chat_id,
                             status_msg_id,
-                            f"🧠 **AGY ejecutando tarea (reintento {attempt}/{max_retries})...**",
+                            f"🧠 **AGY ejecutando ({action_label} • {model_label} • reintento {attempt}/{max_retries})...**",
                         )
                     except Exception as me:
                         logger.warning(f"Failed to edit status message on resume: {me}")
 
-        return f"❌ **Error de ejecución de AGY tras {max_retries} reintentos (código {last_return_code})**:\n```\n{last_error}\n```"
+        quota_keywords = [
+            "RESOURCE_EXHAUSTED", "quota", "rate limit", "token limit",
+            "429", "exhausted", "too many requests", "tokens"
+        ]
+        is_quota_issue = any(k.lower() in last_error.lower() for k in quota_keywords)
+
+        err_msg = f"❌ **Error de ejecución de AGY tras {max_retries} reintentos (código {last_return_code})**:\n```\n{last_error}\n```"
+        if is_quota_issue:
+            err_msg += (
+                f"\n\n🚨 **Parece que se ha agotado la cuota o los tokens del modelo `{model_label}`.**\n"
+                f"💡 Usa `/model` para cambiar a otro modelo disponible (como Claude o GPT) y vuelve a intentar con `/c <prompt>`."
+            )
+        return err_msg, conversation_id
     finally:
         stop_heartbeat.set()
         t.join(timeout=1.0)
@@ -713,7 +986,7 @@ def get_memory_info() -> Tuple[Optional[float], Optional[float]]:
     return None, None
 
 
-def get_system_status() -> str:
+def get_system_status(chat_id: Optional[int] = None) -> str:
     """Returns system status overview across Linux and macOS."""
     try:
         try:
@@ -738,9 +1011,12 @@ def get_system_status() -> str:
             ram_str = "N/A"
 
         os_name = "macOS" if sys.platform == "darwin" else ("Linux" if sys.platform.startswith("linux") else sys.platform)
+        current_model = get_current_model(chat_id)
+        current_label = get_model_label(current_model)
 
         return (
             f"📊 **System Status ({os_name})**\n"
+            f"• **Modelo activo:** `{current_label}` (`{current_model}`)\n"
             f"• **Uptime:** {uptime_str}\n"
             f"• **CPU Load:** {load_str}\n"
             f"• **RAM:** {ram_str}\n"
@@ -750,6 +1026,39 @@ def get_system_status() -> str:
         )
     except Exception as e:
         return f"Error obtaining status: {e}"
+
+
+def deliver_agy_response(
+    chat_id: int,
+    response: str,
+    conversation_id: Optional[str],
+    status_msg_id: Optional[int] = None,
+    reply_to_id: Optional[int] = None,
+    user_msg_id: Optional[int] = None,
+):
+    """Send or edit the AGY response in Telegram and persist message->conversation mappings."""
+    quota_markup = None
+    if "agotado la cuota o los tokens" in response or "RESOURCE_EXHAUSTED" in response:
+        quota_markup = {
+            "inline_keyboard": [
+                [{"text": "🔄 Cambiar modelo de IA", "callback_data": "open_model_menu"}]
+            ]
+        }
+
+    tracked_ids: List[Optional[int]] = []
+    if user_msg_id is not None:
+        tracked_ids.append(user_msg_id)
+
+    if status_msg_id:
+        out_ids: List[int] = []
+        edit_message(chat_id, status_msg_id, response, reply_markup=quota_markup, out_message_ids=out_ids)
+        tracked_ids.extend(out_ids)
+    else:
+        sent_ids = send_message(chat_id, response, reply_to_id=reply_to_id, reply_markup=quota_markup)
+        tracked_ids.extend(sent_ids)
+
+    if conversation_id:
+        save_message_conversations(chat_id, tracked_ids, conversation_id)
 
 
 def handle_callback_query(cb: dict):
@@ -775,6 +1084,26 @@ def handle_callback_query(cb: dict):
         edit_message(chat_id, message_id, "❌ **Tarea cancelada.**")
         return
 
+    if data == "open_model_menu":
+        msg_text, markup = build_model_selection_message(chat_id)
+        send_message(chat_id, msg_text, reply_markup=markup)
+        return
+
+    if data.startswith("set_model:"):
+        model_id = data.split(":", 1)[1]
+        current_model = get_current_model(chat_id)
+        label = get_model_label(model_id)
+
+        if model_id == current_model:
+            answer_callback_query(cb_id, f"El modelo activo ya es: {label}")
+            return
+
+        set_current_model(model_id, chat_id)
+        answer_callback_query(cb_id, f"Modelo cambiado a: {label}")
+        msg_text, markup = build_model_selection_message(chat_id)
+        edit_message(chat_id, message_id, msg_text, reply_markup=markup)
+        return
+
     if data.startswith("cont:") or data.startswith("new:"):
         action, task_id = data.split(":", 1)
         task = pending_audio_tasks.pop(task_id, None)
@@ -784,17 +1113,26 @@ def handle_callback_query(cb: dict):
 
         continue_session = (action == "cont")
         prompt = task["text"]
+        user_msg_id = task.get("user_msg_id")
+        model = get_current_model(chat_id)
+        model_label = get_model_label(model)
         action_label = "Continuar sesión 💬" if continue_session else "Nueva sesión 🆕"
 
         edit_message(
             chat_id,
             message_id,
-            f"🧠 **AGY ejecutando tarea ({action_label})**...\n\n📝 _{prompt}_",
+            f"🧠 **AGY ejecutando ({action_label} • {model_label})**...\n\n📝 _{prompt}_",
         )
 
         def worker():
-            response = run_agy_subprocess(prompt, continue_session, chat_id, status_msg_id=message_id)
-            edit_message(chat_id, message_id, response)
+            response, conv_id = run_agy_subprocess(prompt, continue_session, chat_id, status_msg_id=message_id, model=model)
+            deliver_agy_response(
+                chat_id,
+                response,
+                conv_id,
+                status_msg_id=message_id,
+                user_msg_id=user_msg_id,
+            )
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -868,14 +1206,34 @@ def process_audio_message(msg: dict):
                 return
 
             intent, clean_prompt = detect_session_intent(raw_text)
+            replied_conv_id = get_replied_conversation_id(msg)
+
+            target_conv_id = None
+            if intent is False:
+                # Explicit "new session" spoken by user overrides reply context
+                target_conv_id = None
+            elif replied_conv_id:
+                # Replying to a tracked message automatically continues that conversation
+                intent = True
+                target_conv_id = replied_conv_id
 
             if intent is not None:
-                # Explicit intent spoken by user -> Direct execution
-                action_label = "Continuar sesión 💬" if intent else "Nueva sesión limpia 🆕"
-                logger.info(f"Explicit intent detected: {'CONTINUE' if intent else 'NEW'}. Clean prompt: {clean_prompt}")
+                # Explicit intent or reply to tracked conversation -> Direct execution
+                model = get_current_model(chat_id)
+                model_label = get_model_label(model)
+                if target_conv_id:
+                    action_label = "Continuar hilo 💬"
+                elif intent:
+                    action_label = "Continuar sesión 💬"
+                else:
+                    action_label = "Nueva sesión limpia 🆕"
+                logger.info(
+                    f"Direct audio execution: {'CONTINUE' if intent else 'NEW'} "
+                    f"(conv_id={target_conv_id}). Clean prompt: {clean_prompt}"
+                )
 
                 initial_status = (
-                    f"🎙️ **Nota de voz recibida ({action_label})**\n"
+                    f"🎙️ **Nota de voz recibida ({action_label} • {model_label})**\n"
                     f"📝 _{clean_prompt}_\n\n"
                     f"🧠 **AGY ejecutando tarea...**"
                 )
@@ -885,11 +1243,22 @@ def process_audio_message(msg: dict):
                     sent = send_message(chat_id, initial_status, reply_to_id=msg_id)
                     status_id = sent[0] if sent else None
 
-                response = run_agy_subprocess(clean_prompt, intent, chat_id, status_msg_id=status_id)
-                if status_id:
-                    edit_message(chat_id, status_id, response)
-                else:
-                    send_message(chat_id, response, reply_to_id=msg_id)
+                response, conv_id = run_agy_subprocess(
+                    clean_prompt,
+                    intent,
+                    chat_id,
+                    status_msg_id=status_id,
+                    model=model,
+                    conversation_id=target_conv_id,
+                )
+                deliver_agy_response(
+                    chat_id,
+                    response,
+                    conv_id,
+                    status_msg_id=status_id,
+                    reply_to_id=msg_id,
+                    user_msg_id=msg_id,
+                )
 
             else:
                 # No intent specified -> Offer interactive buttons
@@ -897,6 +1266,7 @@ def process_audio_message(msg: dict):
                 pending_audio_tasks[task_id] = {
                     "text": clean_prompt,
                     "chat_id": chat_id,
+                    "user_msg_id": msg_id,
                     "created_at": time.time(),
                 }
 
@@ -988,17 +1358,50 @@ def process_image_message(msg: dict):
         return
 
     caption = msg.get("caption", "").strip()
-    continue_session = True
+    replied_conv_id = get_replied_conversation_id(msg)
+    continue_session = False
+    target_conv_id = None
     user_prompt = caption
 
-    if user_prompt.startswith("/new"):
-        continue_session = False
-        user_prompt = user_prompt[4:].strip()
-    elif user_prompt.startswith("/c ") or user_prompt.startswith("/continue "):
+    if caption in ["/c", "/continue"]:
         continue_session = True
-        user_prompt = user_prompt.split(" ", 1)[1].strip()
+        target_conv_id = replied_conv_id
+        user_prompt = ""
+    elif caption.startswith("/c ") or caption.startswith("/continue "):
+        continue_session = True
+        target_conv_id = replied_conv_id
+        user_prompt = caption.split(" ", 1)[1].strip()
+    elif caption.startswith("/c\n") or caption.startswith("/continue\n"):
+        continue_session = True
+        target_conv_id = replied_conv_id
+        user_prompt = caption.split("\n", 1)[1].strip()
+    elif caption == "/new":
+        continue_session = False
+        target_conv_id = None
+        user_prompt = ""
+    elif caption.startswith("/new ") or caption.startswith("/new\n"):
+        continue_session = False
+        target_conv_id = None
+        user_prompt = caption[4:].strip()
+    elif replied_conv_id:
+        continue_session = True
+        target_conv_id = replied_conv_id
+        user_prompt = caption
+    else:
+        continue_session = False
+        target_conv_id = None
+        user_prompt = caption
 
-    sent_status = send_message(chat_id, "🖼️ **Descargando imagen...**", reply_to_id=msg_id)
+    model = get_current_model(chat_id)
+    model_label = get_model_label(model)
+    if target_conv_id:
+        action_label = "Continuar hilo 💬"
+    elif continue_session:
+        action_label = "Continuar sesión 💬"
+    else:
+        action_label = "Nuevo chat 🆕"
+
+    sent_status = send_message(chat_id, f"🖼️ **Descargando imagen ({action_label} • {model_label})...**", reply_to_id=msg_id)
     status_id = sent_status[0] if sent_status else None
 
     def worker():
@@ -1014,10 +1417,9 @@ def process_image_message(msg: dict):
                 edit_message(chat_id, status_id, "❌ Error al descargar la imagen de Telegram.")
             return
 
-        action_label = "Continuar sesión 💬" if continue_session else "Nueva sesión limpia 🆕"
-        initial_status = f"🖼️ **Imagen recibida ({action_label})**\n🧠 **AGY analizando imagen...**"
+        initial_status = f"🖼️ **Imagen recibida ({action_label} • {model_label})**\n🧠 **AGY analizando imagen...**"
         if user_prompt:
-            initial_status = f"🖼️ **Imagen recibida ({action_label})**\n📝 _{user_prompt}_\n\n🧠 **AGY analizando imagen...**"
+            initial_status = f"🖼️ **Imagen recibida ({action_label} • {model_label})**\n📝 _{user_prompt}_\n\n🧠 **AGY analizando imagen...**"
 
         if status_id:
             edit_message(chat_id, status_id, initial_status)
@@ -1033,11 +1435,22 @@ def process_image_message(msg: dict):
                 f"Por favor, examínala detalladamente usando tu herramienta `read_file` y describe su contenido, detecta cualquier texto o datos relevantes y ofrece tu asistencia."
             )
 
-        response = run_agy_subprocess(prompt, continue_session, chat_id, status_msg_id=status_id)
-        if status_id:
-            edit_message(chat_id, status_id, response)
-        else:
-            send_message(chat_id, response, reply_to_id=msg_id)
+        response, conv_id = run_agy_subprocess(
+            prompt,
+            continue_session,
+            chat_id,
+            status_msg_id=status_id,
+            model=model,
+            conversation_id=target_conv_id,
+        )
+        deliver_agy_response(
+            chat_id,
+            response,
+            conv_id,
+            status_msg_id=status_id,
+            reply_to_id=msg_id,
+            user_msg_id=msg_id,
+        )
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -1081,51 +1494,148 @@ def handle_message(msg: dict):
 
     # Built-in commands
     if text in ["/start", "/help"]:
+        current_model = get_current_model(chat_id)
+        current_label = get_model_label(current_model)
         welcome = (
             "🤖 **AGY Telegram Assistant**\n\n"
-            "Gateway connected to your Google Antigravity CLI (AGY) agent.\n\n"
-            "**Usage instructions:**\n"
-            "• Send any text message to interact (persists conversation context).\n"
-            "• Send a **photo or screenshot** (with or without caption) for multimodal inspection.\n"
-            "• Send a **voice note** or audio:\n"
-            "   - Say *'New chat: ...'* or *'Continue: ...'* for direct execution.\n"
-            "   - Or leave it unstated to receive interactive buttons.\n"
-            "• `/new <prompt>` : Run a task starting from a fresh session (clears previous context).\n"
-            "• `/c <prompt>` or `/continue <prompt>` : Explicitly continue previous session.\n"
-            "• `/status` : View host system load and service status.\n"
-            "• `/help` : Show this help message."
+            "Conectado a tu agente Google Antigravity CLI (AGY).\n\n"
+            f"• **Modelo actual:** `{current_label}` (`{current_model}`)\n\n"
+            "**Instrucciones de uso:**\n"
+            "• **Nuevo chat:** Envía cualquier mensaje de texto o imagen para iniciar una conversación nueva (por defecto siempre es un nuevo chat).\n"
+            "• **Responder a un mensaje:** Haz *Responder (Reply)* sobre cualquier respuesta del bot para continuar automáticamente esa conversación concreta sin necesidad de `/c` (puedes llevar varias sesiones independientes en paralelo).\n"
+            "• **Continuar última sesión:** Usa `/c <prompt>` o `/continue <prompt>` para continuar la sesión más reciente.\n"
+            "• **Elegir modelo:** Usa `/model` o `/models` para cambiar el modelo de IA (se recuerda para nuevos chats y continuaciones, ideal si se agotan los tokens).\n"
+            "• **Imágenes:** Envía capturas o fotos (con o sin texto). Usa `/c` en el pie si quieres continuar la conversación previa.\n"
+            "• **Notas de voz:** Envía audio o notas de voz (di *'Nuevo chat'* o *'Continúa'*, o usa los botones interactivos).\n"
+            "• `/status` : Ver estado del host y modelo activo.\n"
+            "• `/help` : Ver este mensaje de ayuda."
         )
         send_message(chat_id, welcome, reply_to_id=msg.get("message_id"))
         return
 
     if text == "/status":
-        status_text = get_system_status()
+        status_text = get_system_status(chat_id)
         send_message(chat_id, status_text, reply_to_id=msg.get("message_id"))
         return
 
-    continue_session = True
-    prompt = text
-
-    if text.startswith("/new "):
-        continue_session = False
-        prompt = text[5:].strip()
-    elif text.startswith("/c ") or text.startswith("/continue "):
-        continue_session = True
-        prompt = text.split(" ", 1)[1].strip()
-
-    if not prompt:
-        send_message(chat_id, "⚠️ Por favor, escribe un prompt para ejecutar.", reply_to_id=msg.get("message_id"))
+    if text in ["/model", "/models"]:
+        msg_text, markup = build_model_selection_message(chat_id)
+        send_message(chat_id, msg_text, reply_to_id=msg.get("message_id"), reply_markup=markup)
         return
 
-    sent_status = send_message(chat_id, "🧠 **AGY ejecutando tarea...**", reply_to_id=msg.get("message_id"))
+    if text.startswith("/model ") or text.startswith("/models "):
+        target = text.split(" ", 1)[1].strip().lower()
+        models = get_available_models()
+        matched = None
+        for m_id, label in models:
+            if target == m_id.lower() or target == label.lower():
+                matched = (m_id, label)
+                break
+        if not matched:
+            for m_id, label in models:
+                if target in m_id.lower() or target in label.lower():
+                    matched = (m_id, label)
+                    break
+        if matched:
+            set_current_model(matched[0], chat_id)
+            send_message(
+                chat_id,
+                f"✅ **Modelo actualizado a:** `{matched[1]}` (`{matched[0]}`)\n\n"
+                f"Se utilizará para todos tus **nuevos chats** y **continuaciones**.",
+                reply_to_id=msg.get("message_id"),
+            )
+        else:
+            send_message(
+                chat_id,
+                f"⚠️ Modelo '{target}' no reconocido.\nUsa `/model` para ver la lista interactiva de modelos disponibles.",
+                reply_to_id=msg.get("message_id"),
+            )
+        return
+
+    msg_id = msg.get("message_id")
+    replied_conv_id = get_replied_conversation_id(msg)
+    continue_session = False
+    target_conv_id = None
+    prompt = text
+
+    # Handle /c or /continue with no argument
+    if text in ["/c", "/continue"]:
+        send_message(
+            chat_id,
+            "⚠️ **Continuar sesión:** Por favor escribe tu mensaje después del comando.\n"
+            "Ejemplo: `/c explica esto con más detalle`\n\n"
+            "💡 _Nota: También puedes hacer Responder (Reply) directamente a cualquier mensaje del bot sin usar `/c`._",
+            reply_to_id=msg_id,
+        )
+        return
+
+    if text.startswith("/c ") or text.startswith("/continue "):
+        continue_session = True
+        target_conv_id = replied_conv_id
+        prompt = text.split(" ", 1)[1].strip()
+    elif text.startswith("/c\n") or text.startswith("/continue\n"):
+        continue_session = True
+        target_conv_id = replied_conv_id
+        prompt = text.split("\n", 1)[1].strip()
+    elif text == "/new":
+        send_message(
+            chat_id,
+            "⚠️ Por favor escribe tu prompt tras `/new` (aunque ahora cualquier mensaje sin `/c` ni respuesta a un hilo ya inicia un chat nuevo de forma automática).",
+            reply_to_id=msg_id,
+        )
+        return
+    elif text.startswith("/new ") or text.startswith("/new\n"):
+        continue_session = False
+        target_conv_id = None
+        prompt = text[4:].strip()
+    elif replied_conv_id:
+        # Replying to a tracked bot/user message automatically continues that conversation!
+        continue_session = True
+        target_conv_id = replied_conv_id
+        prompt = text
+    else:
+        # Default is ALWAYS a new chat if /c is not specified and not replying to a tracked thread!
+        continue_session = False
+        target_conv_id = None
+        prompt = text
+
+    if not prompt:
+        send_message(chat_id, "⚠️ Por favor, escribe un prompt para ejecutar.", reply_to_id=msg_id)
+        return
+
+    model = get_current_model(chat_id)
+    model_label = get_model_label(model)
+    if target_conv_id:
+        action_label = "Continuar hilo 💬"
+    elif continue_session:
+        action_label = "Continuar sesión 💬"
+    else:
+        action_label = "Nuevo chat 🆕"
+
+    sent_status = send_message(
+        chat_id,
+        f"🧠 **AGY ejecutando ({action_label} • {model_label})...**",
+        reply_to_id=msg_id,
+    )
     status_msg_id = sent_status[0] if sent_status else None
 
     def worker():
-        response = run_agy_subprocess(prompt, continue_session, chat_id, status_msg_id=status_msg_id)
-        if status_msg_id:
-            edit_message(chat_id, status_msg_id, response)
-        else:
-            send_message(chat_id, response, reply_to_id=msg.get("message_id"))
+        response, conv_id = run_agy_subprocess(
+            prompt,
+            continue_session,
+            chat_id,
+            status_msg_id=status_msg_id,
+            model=model,
+            conversation_id=target_conv_id,
+        )
+        deliver_agy_response(
+            chat_id,
+            response,
+            conv_id,
+            status_msg_id=status_msg_id,
+            reply_to_id=msg_id,
+            user_msg_id=msg_id,
+        )
 
     threading.Thread(target=worker, daemon=True).start()
 

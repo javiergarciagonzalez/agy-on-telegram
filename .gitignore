@@ -17,6 +17,8 @@ venv/
 images/
 *.tmp
 *.log
+preferences.json
+preferences.json.tmp
 
 # System & IDE
 .DS_Store

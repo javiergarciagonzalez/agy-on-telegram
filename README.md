@@ -8,17 +8,21 @@ Whether running on a personal Mac, Linux workstation, home lab, VPS, or NAS, `ag
 
 ## ✨ Features
 
-- 💬 **Full Chat & Memory Management**:
-  - Remembers conversation context across messages.
-  - `/new <prompt>`: Spin up a fresh session with no prior memory.
-  - `/c <prompt>` or `/continue <prompt>`: Explicitly continue the existing conversation.
+- 🧠 **Dynamic Model Selection & Quota Switcher**:
+  - `/model` or `/models`: Interactively choose which AI model to use via Telegram inline buttons (or direct command `/model <name>`).
+  - **Persistent across sessions**: The selected model is remembered for both new chats and continuations.
+  - **Token exhaustion recovery**: If tokens or quota run out on the current model, the bot notifies you with a one-tap button to switch models and resume with `/c <prompt>`.
+- 💬 **Clean New Chat by Default**:
+  - Regular text messages and image attachments automatically start a **fresh session** by default.
+  - `/c <prompt>` or `/continue <prompt>`: Explicitly continues the previous conversation session.
+  - `/new <prompt>`: Explicitly start a fresh session.
 - 🎙️ **Voice & Audio Notes (Whisper Integration)**:
   - Send voice notes or audio messages directly to Telegram.
   - Transcribes audio via a local Whisper HTTP endpoint.
   - **Voice intent detection**: Say *"New chat: ..."* or *"Continue with: ..."* in your voice note for hands-free routing, or let the bot present interactive inline buttons (*"Continue session"* vs. *"New session"*).
 - 🖼️ **Vision & Multimodal Support**:
   - Send photos, screenshots, or image files directly.
-  - Automatically downloads them to a temporary workspace directory and instructs `agy` to inspect and analyze them using file-reading tools.
+  - Automatically downloads them to a temporary workspace directory and instructs `agy` to inspect and analyze them using file-reading tools. Use `/c` in the caption to continue the prior conversation.
 - 🔄 **Fault-Tolerant Auto-Retries**:
   - Automatically retries up to **3 times** with exponential backoff (`2s`, `4s`, `6s`) if a backend error, transient model issue, or server restart occurs.
   - In-place message status updates keeping you informed about progress and reattempts.
@@ -26,7 +30,7 @@ Whether running on a personal Mac, Linux workstation, home lab, VPS, or NAS, `ag
   - Restricts execution strictly to authorized Telegram User IDs (`ALLOWED_USER_IDS`).
   - No personal secrets or tokens committed.
 - 📊 **Host Status Diagnostics**:
-  - Built-in `/status` command reporting host uptime, CPU load average, RAM utilization, and active configuration paths.
+  - Built-in `/status` command reporting active model, host uptime, CPU load average, RAM utilization, and active configuration paths.
 
 ---
 
@@ -153,12 +157,13 @@ launchctl unload ~/Library/LaunchAgents/com.user.agy-telegram-bot.plist
 
 | Command | Description |
 | :--- | :--- |
-| `/start`, `/help` | Displays the help message and available features. |
-| `/status` | Shows the server uptime, CPU load, memory usage, and service configuration. |
-| `/new <prompt>` | Runs a prompt starting in a fresh session (clears previous context). |
+| `/start`, `/help` | Displays the help message, active model, and usage instructions. |
+| `/model`, `/models` | Shows an interactive menu to view and select the active AI model (persisted for new chats and continuations). Can also be run as `/model <name>`. |
 | `/c <prompt>` | Continues the previous session with the given instruction. |
-| `<plain text>` | Direct prompt execution (persists session context by default). |
-| *Send Photo / Document* | Analyzes the attached image. Can include a text caption for specific guidance. |
+| `<plain text>` | Direct prompt execution (always starts a **fresh session** unless `/c` is specified). |
+| `/new <prompt>` | Explicitly runs a prompt starting in a fresh session. |
+| `/status` | Shows active AI model, server uptime, CPU load, memory usage, and service configuration. |
+| *Send Photo / Document* | Analyzes the attached image. Caption starting with `/c` continues previous session; otherwise starts fresh. |
 | *Send Voice Note* | Transcribes audio with Whisper and routes to AGY. |
 
 ---
